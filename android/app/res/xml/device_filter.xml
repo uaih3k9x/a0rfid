@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- CH340 系列（含兼容变种），vendor 0x1a86=6790 -->
+    <usb-device vendor-id="6790" product-id="21795" /> <!-- 0x5523 CH340 -->
+    <usb-device vendor-id="6790" product-id="29987" /> <!-- 0x7523 CH340K -->
+    <usb-device vendor-id="6790" product-id="21802" /> <!-- 0x552a CH340B -->
+</resources>

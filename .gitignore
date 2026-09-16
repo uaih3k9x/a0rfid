@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+android/build/
+android/debug.keystore
+.DS_Store
