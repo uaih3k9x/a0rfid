@@ -4,11 +4,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * R2000-family desktop reader protocol, verified on hardware
+ * R2000 协议（UCCHIP 桌面发卡器，固件 V2.4.1 真机验证）
  * 帧: A0 | LEN | ADDR | CMD | DATA... | SUM   （SUM = 8位二补数校验和）
  * READ(0x81):  {mb, addr×4, cnt×2, pwd×4}                — IDA 逆向 libnative-lib.so case129
  * WRITE(0x82): {pwd×4, mb, addr×4, cnt×2, data}          — case130
- * 响应 CMD 不带 0x80 位；标签类指令 DATA 首字节为状态码(0x10 成功)
+ * 响应 CMD 不带 0x80 位；本固件 READ/WRITE 状态 0x00 成功，控制指令 0x10 成功。
  */
 public final class RfidProto {
     public static final byte ADDR = 0x00;
@@ -52,23 +52,33 @@ public final class RfidProto {
 
     /** 单帧解析：校验失败/不完整返回 null */
     public static int[] parseFrame(byte[] buf, int off, int len) {
+        int i = frameStart(buf, off, len);
+        if (i < 0) return null;
+        int ln = buf[i + 1] & 0xFF;
+        int[] out = new int[ln - 2];
+        out[0] = buf[i + 3] & 0xFF;
+        for (int j = 0; j < ln - 3; j++) out[1 + j] = buf[i + 4 + j] & 0xFF;
+        return out;
+    }
+
+    private static int frameStart(byte[] buf, int off, int len) {
         for (int i = off; i < len; i++) {
             if (buf[i] != (byte) 0xA0) continue;
-            if (i + 1 >= len) return null;                            // 只剩帧头
+            if (i + 1 >= len) return -1;
             int ln = (buf[i + 1] & 0xFF);
-            if (i + ln + 2 > len) return null;                        // 不完整
-            if (checksum(buf, i + ln + 1) != (buf[i + ln + 1] & 0xFF)) continue;  // 校验失败换下一个A0
-            int[] out = new int[1 + Math.max(0, ln - 3)];             // {cmd, data...}
-            out[0] = buf[i + 3] & 0xFF;
-            for (int j = 0; j < ln - 3; j++) out[1 + j] = buf[i + 4 + j] & 0xFF;
-            return out;
+            if (ln < 3) continue;
+            if (i + ln + 2 > len) return -1;
+            int sum = 0;
+            for (int j = i; j < i + ln + 2; j++) sum += buf[j] & 0xFF;
+            if ((sum & 0xFF) == 0) return i;
         }
-        return null;
+        return -1;
     }
 
     /** 帧总长（用于消费缓冲） */
     public static int frameLen(byte[] buf, int off) {
-        return ((buf[off + 1] & 0xFF) + 2);
+        int start = frameStart(buf, off, buf.length);
+        return start < 0 ? 0 : start - off + (buf[start + 1] & 0xFF) + 2;
     }
 
     public static byte[] buildRead(int bank, int addr, int wordCnt, byte[] pwd) {
@@ -114,22 +124,36 @@ public final class RfidProto {
      * fr = {cmd, 状态, 天线, 信号, PC×2, EPC×12, CRC×2, 读出数据×N, N×2(BE), 01 01}
      * 状态 0x00=成功；返回 null 表示失败，成功返回读出数据 */
     public static byte[] parseReadData(int[] fr) {
-        if (fr.length < 6 || fr[1] != 0x00) return null;
+        if (fr == null || fr.length < 12 || fr[0] != CMD_READ || fr[1] != 0x00) return null;
         int n = fr.length;
         int dl = (fr[n - 4] << 8) | fr[n - 3];                     // 尾部长度字段
-        if (dl < 0 || dl > n - 5) return null;
+        int epcBytes = (((fr[4] << 8) | fr[5]) >>> 11) * 2;
+        if (n - 4 - dl != 8 + epcBytes || (dl & 1) != 0) return null;
         byte[] out = new byte[dl];
         for (int i = 0; i < dl; i++) out[i] = (byte) fr[n - 4 - dl + i];
         return out;
     }
 
+    public static String parseReadEpc(int[] fr) {
+        if (parseReadData(fr) == null) return null;
+        int epcBytes = (((fr[4] << 8) | fr[5]) >>> 11) * 2;
+        return hex(fr, 6, 6 + epcBytes);
+    }
+
+    static boolean isReadAck(int[] fr) {
+        return fr != null && fr.length == 2 && fr[0] == CMD_READ
+                && (fr[1] == 0x00 || fr[1] == OK);
+    }
+
     public static String statusText(int st) {
         switch (st) {
+            case 0x00: return "成功";
             case 0x10: return "成功";
             case 0x11: return "命令失败/场内无标签";
             case 0x20: return "CPU复位错误";
             case 0x23: return "收发缓存溢出";
             case 0x24: return "设置频段失败";
+            case 0x43: return "存储区不存在或地址越界";
             case 0x50: return "获取RN16失败";
             default: return "0x" + Integer.toHexString(st);
         }
@@ -142,7 +166,7 @@ public final class RfidProto {
     }
 
     public static Tag parseTag(int[] data) {
-        if (data.length < 12) return null;
+        if (data.length < 13) return null;
         Tag t = new Tag();
         int n = data.length;                 // data[0]=cmd; data[1]=antenna; [2,4)=PC; [4,n-7)=EPC; 尾3字节=频率
         t.antenna = data[1];

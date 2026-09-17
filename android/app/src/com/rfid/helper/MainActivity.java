@@ -35,13 +35,19 @@ public class MainActivity extends Activity {
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private Ch340Usb ch340;
-    private TextView tvState, tvInfo, tvCount;
-    private Button btnScan, btnSettings;
+    private TextView tvState, tvInfo, tvCount, tvProgress;
+    private Button btnScan, btnSettings, btnQuickWrite;
     private ListView list;
     private final Map<String, RfidProto.Tag> tags = new LinkedHashMap<>();
+    private final Map<String, List<TagMemoryReader.Bank>> readResults = new LinkedHashMap<>();
     private ArrayAdapter<String> adapter;
     private volatile boolean invOn = false, connected = false;
-    private Thread invThread;
+    private volatile boolean operationBusy, destroyed, readCancelled;
+    private String readingEpc;
+    private String lastReadEpc;
+    private boolean quickWriteOpen;
+    private int scanGeneration;
+    private volatile Thread invThread;
     private final Object lock = new Object();
     private int powerNow = 20, antennaNow = 0;
 
@@ -57,6 +63,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        destroyed = true;
         unregisterReceiver(usbRx);
         closeDevice();
         super.onDestroy();
@@ -78,7 +85,7 @@ public class MainActivity extends Activity {
 
     // ── 连接 ─────────────────────────────────────────────
     private void tryConnect() {
-        if (connected) return;
+        if (connected || operationBusy || destroyed) return;
         UsbManager mgr = (UsbManager) getSystemService(USB_SERVICE);
         UsbDevice dev = Ch340Usb.find(mgr);
         if (dev == null) { setState("● 未连接（插 USB）", DIM); return; }
@@ -92,8 +99,7 @@ public class MainActivity extends Activity {
         if (ch340.open(dev, RfidProto.BAUD)) {
             connected = true;
             setState("● 已连接", ACCENT);
-            new Thread(this::queryInfo).start();
-            startInventory();
+            pauseForOp(this::queryInfo, !quickWriteOpen);
         } else {
             setState("● 连接失败: " + ch340.error, Color.RED);
         }
@@ -102,7 +108,9 @@ public class MainActivity extends Activity {
     private void closeDevice() {
         invOn = false;
         connected = false;
-        if (ch340 != null) ch340.close();
+        scanGeneration++;
+        synchronized (lock) { if (ch340 != null) ch340.close(); }
+        setScanBtn();
         setState("● 未连接（插 USB）", DIM);
         ui.post(() -> tvInfo.setText(""));
     }
@@ -110,7 +118,7 @@ public class MainActivity extends Activity {
     private void queryInfo() {
         int[][] rs = {cmd(RfidProto.CMD_GET_FW_VERSION, new byte[0]), cmd(RfidProto.CMD_GET_OUTPUT_POWER, new byte[0])};
         final String s;
-        if (rs[0] != null && rs[0].length > 1 && rs[1] != null && rs[1].length > 1) {
+        if (rs[0] != null && rs[0].length >= 4 && rs[1] != null && rs[1].length > 1) {
             powerNow = rs[1][1];
             s = String.format("固件 V%d.%d.%d   功率 %d dBm", rs[0][1], rs[0][2], rs[0][3], rs[1][1]);
         } else s = "设备无响应（可能死机，重新插拔 USB）";
@@ -118,7 +126,7 @@ public class MainActivity extends Activity {
     }
 
     // ── 核心指令（同步，需在后台线程调用）────────────────
-    /** 返回匹配 cmd 的最长帧 {cmd,data...}，超时返回 null */
+    /** 返回匹配的响应 {cmd,data...}；READ 跳过独立 ACK 等待数据。 */
     private int[] cmd(int cmd, byte[] dataArea) {
         return cmd(cmd, dataArea, 1200);
     }
@@ -126,12 +134,14 @@ public class MainActivity extends Activity {
     private int[] cmd(int cmd, byte[] dataArea, int timeoutMs) {
         synchronized (lock) {
             if (ch340 == null || !connected) return null;
-            byte[] out = new byte[0];
+            long drainDeadline = System.currentTimeMillis() + 150;
+            while (connected && System.currentTimeMillis() < drainDeadline && ch340.read(512, 50).length > 0) {}
+            if (!connected) return null;
             ch340.write(RfidProto.encode(cmd, dataArea), 1000);
-            long deadline = System.currentTimeMillis() + timeoutMs + 800;
+            long deadline = System.currentTimeMillis() + timeoutMs;
             int[] best = null;
             java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
-            while (System.currentTimeMillis() < deadline) {
+            while (connected && System.currentTimeMillis() < deadline) {
                 byte[] chunk = ch340.read(256, 60);
                 if (chunk.length > 0) buf.write(chunk, 0, chunk.length);
                 byte[] b = buf.toByteArray();
@@ -141,9 +151,9 @@ public class MainActivity extends Activity {
                     if (fr == null) break;
                     int len = RfidProto.frameLen(b, off);
                     off += len;
-                    if ((fr[0] & 0x7F) == (cmd & 0x7F) || (cmd < 0x80 && fr[0] == ((cmd | 0x80) & 0xFF))) {
+                    if (fr[0] == cmd || (cmd < 0x80 && fr[0] == (cmd | 0x80))) {
                         if (best == null || fr.length > best.length) best = fr;
-                        if (fr.length > 1) return best;     // 数据帧到齐
+                        if (fr.length > 1 && !RfidProto.isReadAck(fr)) return best;
                     }
                 }
                 if (off > 0 && off >= b.length) buf.reset();
@@ -155,42 +165,68 @@ public class MainActivity extends Activity {
 
     // ── 盘存 ─────────────────────────────────────────────
     private void startInventory() {
-        if (!connected || (invThread != null && invThread.isAlive())) return;
+        if (!connected || operationBusy || destroyed || (invThread != null && invThread.isAlive())) return;
+        final int generation = ++scanGeneration;
         invOn = true;
+        tvProgress.setText("扫描中");
         setScanBtn();
         invThread = new Thread(() -> {
-            synchronized (lock) {
-                if (ch340 != null && connected) {
-                    ch340.write(RfidProto.encode(RfidProto.CMD_SET_WORK_ANT, new byte[]{(byte) antennaNow}), 500);
-                    try { Thread.sleep(60); } catch (InterruptedException ignored) {}
-                    ch340.write(RfidProto.encode(RfidProto.CMD_REAL_TIME_INV, new byte[]{(byte) antennaNow}), 500);
-                }
-            }
-            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
-            int empty = 0;
-            while (invOn && connected) {
-                byte[] chunk;
-                synchronized (lock) { chunk = ch340 != null ? ch340.read(512, 80) : new byte[0]; }
-                if (chunk.length == 0) { if (++empty > 400) break; continue; }
-                empty = 0;
-                buf.write(chunk, 0, chunk.length);
-                byte[] b = buf.toByteArray();
-                int off = 0;
-                while (true) {
-                    int[] fr = RfidProto.parseFrame(b, off, b.length);
-                    if (fr == null) break;
-                    off += RfidProto.frameLen(b, off);
-                    if ((fr[0] & 0x7F) == (RfidProto.CMD_REAL_TIME_INV & 0x7F)) {
-                        RfidProto.Tag t = RfidProto.parseTag(fr);
-                        if (t != null) onTag(t);
+            try {
+                synchronized (lock) {
+                    if (ch340 != null && connected) {
+                        ch340.write(RfidProto.encode(RfidProto.CMD_SET_WORK_ANT, new byte[]{(byte) antennaNow}), 500);
+                        try { Thread.sleep(60); } catch (InterruptedException ignored) {}
+                        ch340.write(RfidProto.encode(RfidProto.CMD_REAL_TIME_INV, new byte[]{(byte) antennaNow}), 500);
                     }
                 }
-                if (off >= b.length) buf.reset();
-                else if (off > 0) { byte[] rest = new byte[b.length - off]; System.arraycopy(b, off, rest, 0, rest.length); buf.reset(); buf.write(rest, 0, rest.length); }
-            }
-            synchronized (lock) {
-                if (ch340 != null && connected)
-                    ch340.write(RfidProto.encode(RfidProto.CMD_STOP_INV, new byte[0]), 500);
+                java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+                long nextProbe = System.currentTimeMillis() + 1500;
+                while (invOn && connected) {
+                    byte[] chunk;
+                    synchronized (lock) { chunk = ch340 != null && connected ? ch340.read(512, 80) : new byte[0]; }
+                    if (chunk.length == 0) {
+                        if (System.currentTimeMillis() >= nextProbe) {
+                            synchronized (lock) {
+                                if (invOn && connected && ch340 != null)
+                                    ch340.write(RfidProto.encode(RfidProto.CMD_REAL_TIME_INV, new byte[]{(byte) antennaNow}), 500);
+                            }
+                            nextProbe = System.currentTimeMillis() + 1500;
+                        }
+                        continue;
+                    }
+                    nextProbe = System.currentTimeMillis() + 1500;
+                    buf.write(chunk, 0, chunk.length);
+                    byte[] b = buf.toByteArray();
+                    int off = 0;
+                    while (true) {
+                        int[] fr = RfidProto.parseFrame(b, off, b.length);
+                        if (fr == null) break;
+                        off += RfidProto.frameLen(b, off);
+                        if (fr[0] == RfidProto.CMD_REAL_TIME_INV) {
+                            RfidProto.Tag t = RfidProto.parseTag(fr);
+                            if (t != null) {
+                                invOn = false;
+                                onTag(t, generation);
+                                break;
+                            }
+                        }
+                    }
+                    if (off >= b.length) buf.reset();
+                    else if (off > 0) { byte[] rest = new byte[b.length - off]; System.arraycopy(b, off, rest, 0, rest.length); buf.reset(); buf.write(rest, 0, rest.length); }
+                }
+            } catch (Exception e) {
+                toast("扫描失败: " + e.getMessage());
+            } finally {
+                synchronized (lock) {
+                    if (ch340 != null && connected)
+                        ch340.write(RfidProto.encode(RfidProto.CMD_STOP_INV, new byte[0]), 500);
+                }
+                invOn = false;
+                setScanBtn();
+                ui.post(() -> {
+                    if (generation == scanGeneration && !operationBusy && !destroyed)
+                        tvProgress.setText("扫描已停止");
+                });
             }
         }, "inventory");
         invThread.start();
@@ -201,24 +237,34 @@ public class MainActivity extends Activity {
         setScanBtn();
         if (invThread != null) {
             try { invThread.join(2500); } catch (InterruptedException ignored) {}
+            if (invThread.isAlive()) throw new IllegalStateException("盘存线程未停止");
             invThread = null;
+        }
+        synchronized (lock) {
+            // Discard the stop ACK and the tail of the inventory stream before READ.
+            if (ch340 != null && connected) {
+                long deadline = System.currentTimeMillis() + 500;
+                while (System.currentTimeMillis() < deadline && ch340.read(512, 50).length > 0) {}
+            }
         }
     }
 
-    private void onTag(RfidProto.Tag t) {
+    private void onTag(RfidProto.Tag t, int generation) {
         ui.post(() -> {
-            RfidProto.Tag old = tags.get(t.epc);
-            if (old != null) { old.count++; refreshList(); return; }
+            if (destroyed || !connected || generation != scanGeneration) return;
             tags.put(t.epc, t);
             refreshList();
-            Toast.makeText(this, "新标签 " + t.epc, Toast.LENGTH_SHORT).show();
+            readAll(t.epc);
         });
     }
 
     private void refreshList() {
         List<String> rows = new ArrayList<>();
-        for (RfidProto.Tag t : tags.values())
-            rows.add(String.format("%s\n×%d  PC:%s  %d kHz", t.epc, t.count, t.pc, t.freqKhz));
+        for (RfidProto.Tag t : tags.values()) {
+            String state = t.epc.equals(readingEpc) ? "读取中" :
+                    (readResults.containsKey(t.epc) ? "读取已结束" : "已识别");
+            rows.add(String.format("%s\n%s   PC:%s   %d kHz", t.epc, state, t.pc, t.freqKhz));
+        }
         adapter.clear();
         adapter.addAll(rows);
         adapter.notifyDataSetChanged();
@@ -227,92 +273,194 @@ public class MainActivity extends Activity {
 
     // ── 标签操作 ─────────────────────────────────────────
     private void pauseForOp(Runnable op) {
-        new Thread(() -> { stopInventoryAndWait(); op.run(); startInventory(); }).start();
+        pauseForOp(op, invOn);
+    }
+
+    private void pauseForOp(Runnable op, boolean resumeInventory) {
+        pauseForOp(op, resumeInventory, null);
+    }
+
+    private void pauseForOp(Runnable op, boolean resumeInventory, java.util.function.Consumer<String> onError) {
+        if (operationBusy || destroyed) { toast("设备忙"); return; }
+        if (!connected) { toast("未连接设备"); return; }
+        operationBusy = true;
+        scanGeneration++;
+        invOn = false;
+        setScanBtn();
+        new Thread(() -> {
+            try {
+                stopInventoryAndWait();
+                op.run();
+            } catch (Exception e) {
+                toast("操作失败: " + e.getMessage());
+                ui.post(() -> {
+                    tvProgress.setText("操作失败，扫描已暂停");
+                    if (onError != null) onError.accept(e.getMessage());
+                });
+            } finally {
+                ui.post(() -> {
+                    operationBusy = false;
+                    readingEpc = null;
+                    if (destroyed) return;
+                    refreshList();
+                    if (resumeInventory && connected) startInventory();
+                    setScanBtn();
+                    if (!connected) tryConnect();
+                });
+            }
+        }, "rfid-operation").start();
     }
 
     private void readAll(final String epc) {
+        if (operationBusy || !connected) { toast("设备忙或未连接"); return; }
+        readingEpc = epc;
+        readCancelled = false;
+        readResults.remove(epc);
+        refreshList();
+        tvProgress.setText("正在读取 " + epc);
         pauseForOp(() -> {
-            StringBuilder sb = new StringBuilder();
-            byte[] pwd = new byte[4];
-            int[][] tries = {
-                    {RfidProto.CMD_READ, 2, 0, 6},   // TID@0×6
-                    {RfidProto.CMD_READ, 2, 0, 4},   // TID@0×4 兜底
-                    {RfidProto.CMD_READ, 1, 1, 7},   // EPC@1×7 (PC+全EPC)
-                    {RfidProto.CMD_READ, 1, 2, 6},   // EPC@2×6 (纯EPC)
-                    {RfidProto.CMD_READ, 3, 0, 8},   // USER@0×8
-                    {RfidProto.CMD_READ, 3, 0, 4},   // USER@0×4 兜底
-                    {RfidProto.CMD_READ, 0, 0, 4},   // RESERVED@0×4
-            };
-            String[] names = {"TID", "TID", "EPC(PC+EPC)", "EPC(纯)", "USER", "USER", "RESERVED(密钥区)"};
-            for (int i = 0; i < tries.length; i++) {
-                int[] tr = tries[i];
-                String name = names[i];
-                if (i % 2 == 1 && sb.indexOf(names[i - 1] + ":") >= 0) continue;  // 主行成功则跳过兜底行
-                int[] fr = null;
-                for (int att = 0; att < 3 && fr == null; att++)
-                    fr = cmd(tr[0], RfidProto.buildRead(tr[1], tr[2], tr[3], pwd), 900);
-                byte[] data = fr == null ? null : RfidProto.parseReadData(fr);
-                if (data == null) {
-                    String st = fr != null && fr.length > 1 ? RfidProto.statusText(fr[1]) : "无响应";
-                    if (i % 2 == 0 || sb.indexOf(name + ":") < 0) sb.append(name).append(": ").append(st).append("\n");
-                    continue;
+            TagMemoryReader reader = new TagMemoryReader(new TagMemoryReader.Transport() {
+                public int[] read(int bank, int address, int words) {
+                    return cmd(RfidProto.CMD_READ, RfidProto.buildRead(bank, address, words, new byte[4]), 900);
                 }
-                String hexData = RfidProto.hex(data);
-                sb.append(name).append(": ").append(hexData).append("\n");
-                if (name.startsWith("EPC") && hexData.length() >= epc.length()
-                        && !hexData.toUpperCase().contains(epc))
-                    sb.append("  ⚠ 与盘存 EPC 不一致\n");
-            }
-            final String out = sb.toString();
-            ui.post(() -> new AlertDialog.Builder(this)
-                    .setTitle("读取结果")
-                    .setMessage(out)
-                    .setPositiveButton("关闭", null).show());
-        });
+                public boolean isConnected() { return connected && !readCancelled; }
+            });
+            List<TagMemoryReader.Bank> result = reader.readAll(epc, (bank, bytes) ->
+                    ui.post(() -> tvProgress.setText("正在读取 " + RfidProto.BANKS[bank] + "  " + bytes + " 字节")));
+            ui.post(() -> {
+                if (destroyed) return;
+                readResults.put(epc, result);
+                lastReadEpc = epc;
+                readingEpc = null;
+                tvProgress.setText("读取已结束，扫描已暂停");
+                refreshList();
+                showReadResult(epc);
+            });
+        }, false);
+    }
+
+    private String bankState(TagMemoryReader.Bank bank) {
+        switch (bank.end) {
+            case COMPLETE: return bank.data.length == 0 ? "无可读空间 (0x43)" : "读取完成";
+            case ERROR: return "读取失败: " + RfidProto.statusText(bank.status);
+            case NO_RESPONSE: return "无响应，未读完整";
+            case TAG_CHANGED: return "响应来自其他 EPC，已中止";
+            case INVALID_RESPONSE: return "响应格式或长度异常，未读完整";
+            case LIMIT: return "达到读取上限（4096 字节 / 30 秒），未确认读完整";
+            default: return "读取已取消或连接断开";
+        }
+    }
+
+    private void showReadResult(String epc) {
+        List<TagMemoryReader.Bank> result = readResults.get(epc);
+        if (result == null) return;
+        StringBuilder text = new StringBuilder("EPC: ").append(epc).append('\n');
+        for (TagMemoryReader.Bank bank : result) {
+            text.append('\n').append(RfidProto.BANKS[bank.index]).append("  ")
+                    .append(bank.data.length).append(" 字节  ").append(bankState(bank)).append('\n');
+            String hex = RfidProto.hex(bank.data);
+            for (int i = 0; i < hex.length(); i += 32)
+                text.append(String.format("%04X: %s\n", i / 4, hex.substring(i, Math.min(i + 32, hex.length()))));
+        }
+        TextView body = tv(text.toString(), TXT, 15);
+        body.setTypeface(android.graphics.Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);
+        body.setPadding(dp(16), dp(8), dp(16), dp(8));
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(BG);
+        scroll.addView(body);
+        new AlertDialog.Builder(this).setTitle("标签读取结果").setView(scroll)
+                .setPositiveButton("关闭", null)
+                .setNeutralButton("复制内容", (d, w) -> {
+                    android.content.ClipboardManager clipboard = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("RFID", text.toString()));
+                    toast("已复制");
+                })
+                .setNegativeButton("重新读取", (d, w) -> readAll(epc)).show();
     }
 
     private void writeDialog(final String presetEpc) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(40, 30, 40, 10);
-        TextView tip = tv(presetEpc == null ? "输入要写入的 EPC（HEX），写 EPC 区从字 2 开始" : "把【新标签】放到读写头上，然后确认写入", DIM, 14);
-        final EditText input = new EditText(this);
-        input.setText(presetEpc == null ? "" : presetEpc);
-        input.setTextColor(TXT);
-        input.setInputType(InputType.TYPE_CLASS_TEXT);
-        box.addView(tip); box.addView(input);
-        new AlertDialog.Builder(this)
-                .setTitle(presetEpc == null ? "写标签 EPC" : "复制 EPC 到新标签")
-                .setView(box)
-                .setPositiveButton("写入", (d, w) -> {
-                    String hexStr = input.getText().toString().trim();
-                    final byte[] data = RfidProto.unhex(hexStr);
-                    if (data.length < 2 || data.length % 2 != 0 || data.length > 60) {
-                        toast("HEX 长度无效（须偶数字节）"); return;
+        if (operationBusy) { toast("设备忙，请先结束当前操作"); return; }
+        if (invOn || (invThread != null && invThread.isAlive())) {
+            pauseForOp(() -> ui.post(() -> showQuickWrite(presetEpc)), false);
+        } else showQuickWrite(presetEpc);
+    }
+
+    private void showQuickWrite(String epc) {
+        if (destroyed) return;
+        quickWriteOpen = true;
+        Map<Integer, String> initial = new LinkedHashMap<>();
+        Map<Integer, String> notes = new LinkedHashMap<>();
+        if (epc != null) initial.put(1, epc);
+        List<TagMemoryReader.Bank> result = readResults.get(epc);
+        if (result != null) for (TagMemoryReader.Bank bank : result) {
+            // Inventory EPC is the number; the memory dump also includes CRC, PC and unused capacity.
+            if (bank.index != 1 && bank.data.length > 0) {
+                initial.put(bank.index, RfidProto.hex(bank.data));
+                notes.put(bank.index, "带入 " + bank.data.length + " 字节；" + bankState(bank));
+            }
+        }
+        new QuickWriteDialog(this, this::runQuickWrite).show(initial, notes, () -> quickWriteOpen = false);
+    }
+
+    private void runQuickWrite(List<TagWriter.Item> items, byte[] password, boolean checkOnly, QuickWriteDialog.Callback callback) {
+        if (!connected || operationBusy) { callback.finished("读写头未连接或设备忙，请稍后重试"); return; }
+        pauseForOp(() -> {
+            try {
+                TagWriter writer = new TagWriter(new TagWriter.Transport() {
+                    public List<String> inventory() { return inventoryForWrite(); }
+                    public boolean isConnected() { return connected && !destroyed; }
+                    public int[] read(int bank, int address, int words, byte[] pwd) {
+                        return cmd(RfidProto.CMD_READ, RfidProto.buildRead(bank, address, words, pwd), 1000);
                     }
-                    pauseForOp(() -> {
-                        String result = null;
-                        for (int attempt = 1; attempt <= 3 && result == null; attempt++) {
-                            int[] fr = cmd(RfidProto.CMD_WRITE,
-                                    RfidProto.buildWrite(1, 2, data.length / 2, new byte[4], data), 1500);
-                            if (fr != null && fr.length > 1 && fr[1] == 0x00) {   // 0x00=成功（真机验证）
-                                int[] chk = cmd(RfidProto.CMD_READ, RfidProto.buildRead(1, 2, data.length / 2, new byte[4]), 1000);
-                                byte[] rd = chk == null ? null : RfidProto.parseReadData(chk);
-                                String rdHex = rd == null ? "" : RfidProto.hex(rd);
-                                result = rdHex.equalsIgnoreCase(RfidProto.hex(data))
-                                        ? "✔ 写入成功并校验一致"
-                                        : "✔ 已写入（校验读到: " + rdHex + "）";
-                            } else {
-                                String st = (fr != null && fr.length > 1) ? RfidProto.statusText(fr[1]) : "无响应";
-                                if (attempt == 3) result = "✘ 写入失败: " + st;
-                            }
+                    public int[] write(int bank, int address, byte[] data, byte[] pwd) {
+                        return cmd(RfidProto.CMD_WRITE, RfidProto.buildWrite(bank, address, data.length / 2, pwd, data), 1800);
+                    }
+                });
+                TagWriter.Report report = writer.run(items, password, checkOnly, message -> ui.post(() -> {
+                    tvProgress.setText(message);
+                    callback.progress(message);
+                }));
+                ui.post(() -> {
+                    if (destroyed) return;
+                    tvProgress.setText(report.passed() ? "检查通过，扫描已暂停" : "操作结束，请查看检查结果");
+                    callback.finished(report.text(checkOnly));
+                });
+            } catch (Exception e) {
+                ui.post(() -> callback.finished("操作异常: " + e.getMessage() + (checkOnly ? "" : "\n若已开始写入，可能部分改变，请执行只检查确认")));
+            }
+        }, false, message -> callback.finished("未能开始操作: " + message));
+    }
+
+    /** Collect multiple inventory replies before choosing a target for a manual operation. */
+    private List<String> inventoryForWrite() {
+        java.util.Set<String> found = new java.util.LinkedHashSet<>();
+        synchronized (lock) {
+            if (!connected || ch340 == null) return new ArrayList<>();
+            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+            long deadline = System.currentTimeMillis() + 900;
+            ch340.write(RfidProto.encode(RfidProto.CMD_REAL_TIME_INV, new byte[]{(byte) antennaNow}), 500);
+            try {
+                while (connected && System.currentTimeMillis() < deadline) {
+                    byte[] chunk = ch340.read(512, 50);
+                    buffer.write(chunk, 0, chunk.length);
+                    byte[] bytes = buffer.toByteArray();
+                    int off = 0;
+                    int[] frame;
+                    while ((frame = RfidProto.parseFrame(bytes, off, bytes.length)) != null) {
+                        off += RfidProto.frameLen(bytes, off);
+                        if (frame[0] == RfidProto.CMD_REAL_TIME_INV) {
+                            RfidProto.Tag tag = RfidProto.parseTag(frame);
+                            if (tag != null) found.add(tag.epc);
                         }
-                        final String r = result;
-                        ui.post(() -> new AlertDialog.Builder(this).setTitle("写标签").setMessage(r)
-                                .setPositiveButton("好", null).show());
-                    });
-                })
-                .setNegativeButton("取消", null).show();
+                    }
+                    if (off > 0) { buffer.reset(); buffer.write(bytes, off, bytes.length - off); }
+                }
+            } finally {
+                if (connected) ch340.write(RfidProto.encode(RfidProto.CMD_STOP_INV, new byte[0]), 500);
+            }
+        }
+        return new ArrayList<>(found);
     }
 
     private void settingsDialog() {
@@ -352,41 +500,52 @@ public class MainActivity extends Activity {
 
     // ── UI 构建 ──────────────────────────────────────────
     private void buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(BG);
         LinearLayout root = new LinearLayout(this);
+        root.setBackgroundColor(BG);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(36, 50, 36, 36);
-        scroll.addView(root);
+        root.setPadding(dp(16), dp(8), dp(16), dp(8));
 
-        TextView title = tv("RFID 助手", TXT, 26);
-        title.setGravity(Gravity.CENTER);
-        root.addView(title);
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = tv("RFID 助手", TXT, 20);
+        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         tvState = tv("● 未连接（插 USB）", DIM, 15);
-        tvState.setGravity(Gravity.CENTER);
-        root.addView(tvState);
+        header.addView(tvState);
+        root.addView(header);
         tvInfo = tv("", DIM, 13);
-        tvInfo.setGravity(Gravity.CENTER);
         root.addView(tvInfo);
 
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setPadding(0, 24, 0, 8);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setPadding(0, 0, 0, dp(8));
         tvCount = tv("标签: 0", ACCENT, 16);
         btnSettings = mkBtn("⚙ 设置", CARD);
-        LinearLayout.LayoutParams lp0 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
-        tvCount.setLayoutParams(lp0);
-        btnSettings.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        bar.addView(tvCount); bar.addView(btnSettings);
-        root.addView(bar);
-
-        btnScan = mkBtn("▶ 开始盘存", ACCENT);
+        btnQuickWrite = mkBtn("快速写卡", CARD);
+        btnScan = mkBtn("扫描标签", ACCENT);
         btnScan.setTextColor(0xFF06231E);
-        root.addView(btnScan, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        bar.addView(tvCount, new LinearLayout.LayoutParams(0, dp(48), 1));
+        LinearLayout.LayoutParams scanParams = new LinearLayout.LayoutParams(dp(144), dp(48));
+        scanParams.setMargins(0, 0, dp(8), 0);
+        bar.addView(btnScan, scanParams);
+        LinearLayout.LayoutParams writeParams = new LinearLayout.LayoutParams(dp(128), dp(48));
+        writeParams.setMargins(0, 0, dp(8), 0);
+        bar.addView(btnQuickWrite, writeParams);
+        bar.addView(btnSettings, new LinearLayout.LayoutParams(dp(96), dp(48)));
+        root.addView(bar);
+        tvProgress = tv("", DIM, 14);
+        root.addView(tvProgress);
 
         list = new ListView(this);
-        adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, new ArrayList<>());
+        adapter = new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, new ArrayList<>()) {
+            @Override public View getView(int position, View convertView, ViewGroup parent) {
+                TextView row = (TextView) super.getView(position, convertView, parent);
+                row.setTextColor(TXT);
+                row.setTextSize(15);
+                row.setSingleLine(false);
+                return row;
+            }
+        };
         list.setAdapter(adapter);
         list.setDivider(new android.graphics.drawable.ColorDrawable(0xFF232D3D));
         list.setDividerHeight(2);
@@ -394,21 +553,35 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
         btnScan.setOnClickListener(v -> {
+            if (operationBusy) {
+                if (readingEpc != null) {
+                    readCancelled = true;
+                    tvProgress.setText("正在停止读取");
+                }
+                return;
+            }
             if (!connected) { toast("未连接设备"); return; }
-            if (invOn) stopInventoryAndWait(); else startInventory();
+            if (invOn || (invThread != null && invThread.isAlive())) {
+                scanGeneration++;
+                pauseForOp(() -> {}, false);
+                tvProgress.setText("扫描已暂停");
+            } else startInventory();
         });
         btnSettings.setOnClickListener(v -> settingsDialog());
+        btnQuickWrite.setOnClickListener(v -> writeDialog(lastReadEpc));
         list.setOnItemClickListener((p, v, pos, id) -> {
             final String epc = new ArrayList<>(tags.keySet()).get(pos);
             new AlertDialog.Builder(this)
                     .setTitle("标签操作")
-                    .setMessage("EPC: " + epc + "\n次数: " + ((RfidProto.Tag) tags.values().toArray()[pos]).count)
-                    .setPositiveButton("📖 读全部数据", (d, w) -> readAll(epc))
-                    .setNeutralButton("✍ 复制到新标签", (d, w) -> writeDialog(epc))
+                    .setMessage("EPC: " + epc)
+                    .setPositiveButton(readResults.containsKey(epc) ? "查看读取结果" : "读取数据", (d, w) -> {
+                        if (readResults.containsKey(epc)) showReadResult(epc); else readAll(epc);
+                    })
+                    .setNeutralButton("快速写卡 / 检查", (d, w) -> writeDialog(epc))
                     .setNegativeButton("关闭", null).show();
         });
 
-        setContentView(scroll);
+        setContentView(root);
     }
 
     private TextView tv(String s, int color, float size) {
@@ -421,18 +594,27 @@ public class MainActivity extends Activity {
     private Button mkBtn(String s, int bg) {
         Button b = new Button(this, null, 0);
         b.setText(s); b.setTextColor(TXT); b.setTextSize(17);
-        b.setPadding(0, 30, 0, 30);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(8), 0, dp(8), 0);
         b.setBackground(new android.graphics.drawable.GradientDrawable() {{
             setColor(bg);
-            setCornerRadius(22);
+            setCornerRadius(dp(4));
         }});
         b.setOnTouchListener((v, e) -> false);
         return b;
     }
 
     private void setScanBtn() {
-        ui.post(() -> btnScan.setText(invOn ? "■ 停止盘存" : "▶ 开始盘存"));
+        ui.post(() -> {
+            btnScan.setText(operationBusy ? (readingEpc != null ? "停止读取" : "处理中") :
+                    (invOn ? "停止扫描" : "扫描标签"));
+            btnScan.setEnabled(!operationBusy || readingEpc != null);
+            btnSettings.setEnabled(!operationBusy);
+            btnQuickWrite.setEnabled(!operationBusy);
+        });
     }
+
+    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
 
     private void setState(String s, int color) { ui.post(() -> { tvState.setText(s); tvState.setTextColor(color); }); }
     private void toast(String s) { ui.post(() -> Toast.makeText(this, s, Toast.LENGTH_SHORT).show()); }

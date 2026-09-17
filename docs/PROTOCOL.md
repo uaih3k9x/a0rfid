@@ -48,10 +48,12 @@ Realtime inventory tag frame DATA:
 READ data frame DATA:
 
 ```
-[status 0x00][ant][rssi][PC×2][EPC×12][CRC×2][readData×N][N×2(BE)][0x01 0x01]
+[status 0x00][ant][rssi][PC×2][EPC...][CRC×2][readData×N][N×2(BE)][0x01 0x01]
 ```
 
 locate the payload via the trailing BE length field, not by counting headers.
+EPC length in bytes is `((PC >> 11) & 0x1F) * 2`. Validate it against the
+response layout and compare the returned EPC with the expected tag.
 
 ## EPC bank layout (Gen2)
 
@@ -59,4 +61,7 @@ locate the payload via the trailing BE length field, not by counting headers.
 word 0: CRC16   word 1: PC   word 2...: EPC
 ```
 
-write EPC from word 2. the chip maintains CRC and PC itself.
+EPC data starts at word 2; the chip maintains CRC. When changing EPC length,
+update bits 15–11 of PC with the new word count and preserve the other PC bits.
+The Android writer sends PC and EPC together starting at word 1 and checks both
+by reading them back.

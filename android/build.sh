@@ -23,10 +23,11 @@ $BT/aapt2 compile --dir app/res -o $OUT/res.zip
 echo "[4/6] aapt2 链接"
 $BT/aapt2 link -o $OUT/base.apk -I $JAR \
   --manifest AndroidManifest.xml --version-code 1 --version-name 1.0 \
+  --min-sdk-version 24 --target-sdk-version 28 \
   $OUT/res.zip --auto-add-overlay
 
-echo "[5/6] 打包 dex"
-cd $OUT && zip -q base.apk dex/classes.dex && cd ..
+echo "[5/6] 打包 dex（必须放在 APK 根目录）"
+cd $OUT && zip -q base.apk -j dex/classes.dex && cd ..
 
 echo "[6/6] 对齐 + 签名"
 $BT/zipalign -f 4 $OUT/base.apk $OUT/aligned.apk

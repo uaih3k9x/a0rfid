@@ -2,4 +2,5 @@ __pycache__/
 *.pyc
 android/build/
 android/debug.keystore
+android/*.idsig
 .DS_Store
